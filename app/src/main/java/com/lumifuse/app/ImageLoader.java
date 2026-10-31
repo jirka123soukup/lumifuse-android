@@ -9,7 +9,7 @@ import androidx.exifinterface.media.ExifInterface;
 import java.io.IOException;
 import java.io.InputStream;
 
-/** 关闭输入流、校正 EXIF 方向，并按长边缩小，避免直接解码全尺寸包围照片。 */
+/** Zavírá vstupní proudy, opravuje orientaci podle EXIF a zmenšuje podle delší strany. */
 final class ImageLoader {
     private ImageLoader() {}
 
@@ -17,7 +17,7 @@ final class ImageLoader {
         BitmapFactory.Options options = new BitmapFactory.Options();
         try (InputStream input = open(resolver, uri)) {
             if (input.read() != 0xff || input.read() != 0xd8) {
-                throw new IOException("请选择 JPG 格式照片");
+                throw new IOException("Vyberte fotky ve formátu JPG");
             }
         }
         options.inJustDecodeBounds = true;
@@ -25,7 +25,7 @@ final class ImageLoader {
             BitmapFactory.decodeStream(input, null, options);
         }
         if (options.outWidth <= 0 || options.outHeight <= 0) {
-            throw new IOException("照片数据损坏或格式未识别");
+            throw new IOException("Fotka je poškozená nebo má nerozpoznaný formát");
         }
         options.inSampleSize = 1;
         while (Math.max(options.outWidth, options.outHeight) / options.inSampleSize > maxEdge * 2) {
@@ -37,7 +37,7 @@ final class ImageLoader {
         try (InputStream input = open(resolver, uri)) {
             decoded = BitmapFactory.decodeStream(input, null, options);
         }
-        if (decoded == null) throw new IOException("照片解码失败");
+        if (decoded == null) throw new IOException("Fotku se nepodařilo dekódovat");
         try {
             int orientation;
             try (InputStream input = open(resolver, uri)) {
@@ -75,7 +75,7 @@ final class ImageLoader {
 
     private static InputStream open(ContentResolver resolver, Uri uri) throws IOException {
         InputStream input = resolver.openInputStream(uri);
-        if (input == null) throw new IOException("照片读取失败，请重新选择");
+        if (input == null) throw new IOException("Fotku se nepodařilo načíst, vyberte ji znovu");
         return input;
     }
 }

@@ -18,10 +18,13 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** 保持 UI、照片读取与融合算法分离；文件选择器授权访问，不申请整个相册权限。 */
+/** UI, čtení fotek a slučování jsou oddělené; přístup k fotkám jen přes výběr souborů, bez oprávnění k celé galerii. */
 public final class MainActivity extends Activity {
     private static final int PICK_IMAGES = 42;
-    private static final int[] EDGES = {1280, 2048, 3072};
+    /** Delší strana výstupu v px; poslední položka = bez zmenšení (plné rozlišení). */
+    private static final int[] EDGES = {1280, 2048, 3072, 4096, 100000};
+    /** Náhled na displeji se zmenšuje – příliš velký bitmap by při vykreslení shodil aplikaci. */
+    private static final int PREVIEW_EDGE = 2048;
     private final ArrayList<Uri> selected = new ArrayList<>();
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private Spinner mode, size;
@@ -30,7 +33,7 @@ public final class MainActivity extends Activity {
     private TextView status;
     private ImageView preview;
     private ProgressBar progress;
-    private Bitmap result, original;
+    private Bitmap result, original, shown;
     private boolean busy, showingOriginal;
 
     @Override public void onCreate(Bundle state) {
@@ -41,7 +44,7 @@ public final class MainActivity extends Activity {
         }
         buildUi();
         if (!OpenCVLoader.initLocal()) {
-            status.setText("图像处理库初始化失败，请重新安装应用");
+            status.setText("Nepodařilo se načíst knihovnu pro zpracování obrazu, přeinstalujte aplikaci");
             run.setEnabled(false);
         }
     }
@@ -58,28 +61,34 @@ public final class MainActivity extends Activity {
         });
         TextView title = label("LumiFuse", 28);
         title.setTypeface(null, Typeface.BOLD); root.addView(title);
-        root.addView(label("让包围照片，在手机里成为一张好照片", 13));
-        mode = spinner(new String[]{"HDR · 不同曝光", "景深 · 不同焦点"}); root.addView(mode);
-        pick = button("选择 2～7 张 JPG", root); pick.setOnClickListener(view -> pickImages());
-        size = spinner(new String[]{"快速 · 长边 1280", "标准 · 长边 2048", "精细 · 长边 3072（内存占用较高）"});
-        size.setSelection(1); root.addView(size);
-        align = new CheckBox(this); align.setText("自动对齐并裁掉黑边"); align.setChecked(true); root.addView(align);
-        run = button("开始合成", root); run.setOnClickListener(view -> process());
+        root.addView(label("Ze série expozic jedna dobrá fotka – přímo v telefonu", 13));
+        mode = spinner(new String[]{"HDR · různé expozice", "Hloubka ostrosti · různé zaostření"}); root.addView(mode);
+        pick = button("Vybrat 2–7 fotek JPG", root); pick.setOnClickListener(view -> pickImages());
+        size = spinner(new String[]{
+                "Rychlé · delší strana 1280 px",
+                "Standard · delší strana 2048 px",
+                "Jemné · delší strana 3072 px",
+                "Velké · delší strana 4096 px (hodně paměti)",
+                "Plné rozlišení (pomalé, nejvíc paměti)"});
+        size.setSelection(2); root.addView(size);
+        align = new CheckBox(this); align.setText("Automaticky zarovnat a oříznout černé okraje"); align.setChecked(true); root.addView(align);
+        run = button("Sloučit", root); run.setOnClickListener(view -> process());
         progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progress.setIndeterminate(true); progress.setVisibility(View.GONE); root.addView(progress);
-        status = label(selected.isEmpty() ? "尚未选择照片 · 离线处理 · 不上传原片" : "已恢复 " + selected.size() + " 张照片，请重新合成", 13);
+        status = label(selected.isEmpty() ? "Zatím nevybrány žádné fotky · zpracování offline · nic se nenahrává"
+                : "Obnoveno " + selected.size() + " fotek, spusťte slučování znovu", 13);
         root.addView(status);
         preview = new ImageView(this); preview.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        preview.setContentDescription("照片预览");
+        preview.setContentDescription("Náhled fotky");
         root.addView(preview, new LinearLayout.LayoutParams(-1, 0, 1));
         LinearLayout actions = new LinearLayout(this);
-        compare = button("查看参考原图", actions); compare.setEnabled(false);
+        compare = button("Zobrazit originál", actions); compare.setEnabled(false);
         compare.setOnClickListener(view -> {
             showingOriginal = !showingOriginal;
-            preview.setImageBitmap(showingOriginal ? original : result);
-            compare.setText(showingOriginal ? "查看合成结果" : "查看参考原图");
+            preview.setImageBitmap(showingOriginal ? original : shown);
+            compare.setText(showingOriginal ? "Zobrazit výsledek" : "Zobrazit originál");
         });
-        save = button("保存 JPG", actions); save.setEnabled(false);
+        save = button("Uložit JPG", actions); save.setEnabled(false);
         save.setOnClickListener(view -> saveResult()); root.addView(actions);
         setContentView(root);
     }
@@ -102,47 +111,75 @@ public final class MainActivity extends Activity {
             }
         } else if (data.getData() != null) incoming.add(data.getData());
         if (incoming.size() < 2 || incoming.size() > 7) {
-            status.setText("请选择 2～7 张不同的 JPG，当前选择未采用"); return;
+            status.setText("Vyberte 2–7 různých fotek JPG, tento výběr nebyl použit"); return;
         }
         for (Uri uri : incoming) {
             try { getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION); }
-            catch (SecurityException ignored) { /* 部分文件提供者仅支持当前会话授权。 */ }
+            catch (SecurityException ignored) { /* Některé zdroje povolují přístup jen pro aktuální relaci. */ }
         }
         clearResult(); selected.clear(); selected.addAll(incoming);
-        status.setText("已选择 " + selected.size() + " 张 · HDR 用不同曝光，景深用不同焦点");
+        status.setText("Vybráno " + selected.size() + " fotek · HDR = různé expozice, hloubka ostrosti = různé zaostření");
     }
 
     private void process() {
         if (busy) return;
-        if (selected.size() < 2) { status.setText("请先选择 2～7 张 JPG"); return; }
+        if (selected.size() < 2) { status.setText("Nejdřív vyberte 2–7 fotek JPG"); return; }
         final List<Uri> inputs = new ArrayList<>(selected);
         final int edge = EDGES[size.getSelectedItemPosition()];
         final boolean hdr = mode.getSelectedItemPosition() == 0, useAlignment = align.isChecked();
-        clearResult(); setBusy(true); status.setText("准备处理…");
+        clearResult(); setBusy(true); status.setText("Připravuji…");
         worker.execute(() -> {
-            Bitmap fused = null, first = null;
+            Bitmap fused = null, first = null, small = null;
             try {
                 fused = Fusion.merge(getContentResolver(), inputs, edge, hdr, useAlignment,
                         message -> runOnUiThread(() -> { if (!isDestroyed()) status.setText(message); }));
+                small = scaledForPreview(fused);
                 first = ImageLoader.load(getContentResolver(), inputs.get(0), 1280);
-                final Bitmap output = fused, source = first;
+                final Bitmap output = fused, source = first, display = small;
                 runOnUiThread(() -> {
-                    if (isDestroyed()) { output.recycle(); source.recycle(); return; }
-                    result = output; original = source; preview.setImageBitmap(result); setBusy(false);
-                    status.setText("合成完成 · " + result.getWidth() + " × " + result.getHeight()
-                            + " · " + inputs.size() + " 张\n" + (hdr ? "曝光融合 JPG，不是 HDR DNG" : "景深融合：遮挡边缘可能出现光晕"));
+                    if (isDestroyed()) {
+                        if (display != output) display.recycle();
+                        output.recycle(); source.recycle(); return;
+                    }
+                    result = output; original = source; shown = display;
+                    preview.setImageBitmap(shown); setBusy(false);
+                    status.setText("Hotovo · " + result.getWidth() + " × " + result.getHeight()
+                            + " px · " + inputs.size() + " fotek\n"
+                            + (hdr ? "Expoziční fúze do JPG (ne HDR DNG)" : "Hloubka ostrosti: u okrajů předmětů může vzniknout svatozář"));
                 });
             } catch (Exception | OutOfMemoryError error) {
-                if (fused != null) fused.recycle(); if (first != null) first.recycle();
-                reportFailure(error instanceof OutOfMemoryError ? "内存紧张，请选择快速档或减少照片数量" : error.getMessage());
+                if (small != null && small != fused) small.recycle();
+                if (fused != null) fused.recycle();
+                if (first != null) first.recycle();
+                reportFailure(isMemoryError(error)
+                        ? "Došla paměť – zvolte menší velikost výstupu nebo méně fotek"
+                        : error.getMessage());
             }
         });
+    }
+
+    private static boolean isMemoryError(Throwable error) {
+        if (error instanceof OutOfMemoryError) return true;
+        String message = error.getMessage();
+        if (message == null) return false;
+        String lower = message.toLowerCase();
+        return lower.contains("insufficient memory") || lower.contains("out of memory")
+                || lower.contains("failed to allocate");
+    }
+
+    private static Bitmap scaledForPreview(Bitmap source) {
+        int longest = Math.max(source.getWidth(), source.getHeight());
+        if (longest <= PREVIEW_EDGE) return source;
+        float scale = (float) PREVIEW_EDGE / longest;
+        return Bitmap.createScaledBitmap(source,
+                Math.max(1, Math.round(source.getWidth() * scale)),
+                Math.max(1, Math.round(source.getHeight() * scale)), true);
     }
 
     private void saveResult() {
         if (busy || result == null) return;
         final Bitmap image = result;
-        setBusy(true); status.setText("正在保存…");
+        setBusy(true); status.setText("Ukládám…");
         worker.execute(() -> {
             Uri uri = null;
             try {
@@ -152,23 +189,23 @@ public final class MainActivity extends Activity {
                 values.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/LumiFuse");
                 values.put(MediaStore.Images.Media.IS_PENDING, 1);
                 uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
-                if (uri == null) throw new IOException("相册创建文件失败");
+                if (uri == null) throw new IOException("V galerii se nepodařilo vytvořit soubor");
                 try (OutputStream output = getContentResolver().openOutputStream(uri)) {
                     if (output == null || !image.compress(Bitmap.CompressFormat.JPEG, 95, output)) {
-                        throw new IOException("JPG 写入失败");
+                        throw new IOException("Zápis JPG selhal");
                     }
                 }
                 values.clear(); values.put(MediaStore.Images.Media.IS_PENDING, 0);
-                if (getContentResolver().update(uri, values, null, null) != 1) throw new IOException("相册发布失败");
+                if (getContentResolver().update(uri, values, null, null) != 1) throw new IOException("Zveřejnění v galerii selhalo");
                 runOnUiThread(() -> {
-                    if (!isDestroyed()) { setBusy(false); status.setText("已保存到相册 · Pictures/LumiFuse · 原照片未修改"); }
+                    if (!isDestroyed()) { setBusy(false); status.setText("Uloženo do galerie · Pictures/LumiFuse · originály beze změny"); }
                 });
             } catch (Exception error) {
-                // 仅清理本次生成的未发布空文件，绝不删除输入照片。
+                // Smaže jen prázdný soubor vytvořený teď, nikdy vstupní fotky.
                 if (uri != null) {
                     try { getContentResolver().delete(uri, null, null); } catch (Exception ignored) { }
                 }
-                reportFailure("保存失败：" + error.getMessage());
+                reportFailure("Uložení selhalo: " + error.getMessage());
             } finally {
                 if (isDestroyed()) image.recycle();
             }
@@ -176,7 +213,7 @@ public final class MainActivity extends Activity {
     }
 
     private void reportFailure(String message) {
-        runOnUiThread(() -> { if (!isDestroyed()) { setBusy(false); status.setText("处理未完成：" + message); } });
+        runOnUiThread(() -> { if (!isDestroyed()) { setBusy(false); status.setText("Nedokončeno: " + message); } });
     }
 
     private void setBusy(boolean value) {
@@ -188,9 +225,11 @@ public final class MainActivity extends Activity {
 
     private void clearResult() {
         preview.setImageDrawable(null);
-        if (result != null) result.recycle(); if (original != null) original.recycle();
-        result = null; original = null; showingOriginal = false;
-        save.setEnabled(false); compare.setEnabled(false); compare.setText("查看参考原图");
+        if (shown != null && shown != result) shown.recycle();
+        if (result != null) result.recycle();
+        if (original != null) original.recycle();
+        result = null; original = null; shown = null; showingOriginal = false;
+        save.setEnabled(false); compare.setEnabled(false); compare.setText("Zobrazit originál");
     }
 
     @Override protected void onSaveInstanceState(Bundle state) {
@@ -201,7 +240,8 @@ public final class MainActivity extends Activity {
 
     @Override protected void onDestroy() {
         worker.shutdownNow();
-        // 保存线程持有 result 时由该线程释放，避免压缩过程中的位图回收。
+        // Pokud výsledek právě ukládá vlákno, uvolní ho to vlákno samo.
+        if (shown != null && shown != result) shown.recycle();
         if (!busy && result != null) result.recycle();
         if (original != null) original.recycle();
         super.onDestroy();

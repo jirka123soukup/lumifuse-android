@@ -12,14 +12,14 @@ import org.opencv.video.Video;
 import java.util.ArrayList;
 import java.util.List;
 
-/** 合成核心：缩略图 ECC 仿射配准，HDR 多尺度曝光融合 / 清晰度加权景深融合。 */
+/** Jádro slučování: ECC afinní zarovnání na náhledu, HDR expoziční fúze (Mertens) / skládání ostrosti. */
 final class Fusion {
     interface Progress { void update(String message); }
     private Fusion() {}
 
     static Bitmap merge(ContentResolver resolver, List<Uri> uris, int edge,
                         boolean hdr, boolean align, Progress progress) throws Exception {
-        if (uris.size() < 2 || uris.size() > 7) throw new IllegalArgumentException("需要 2～7 张照片");
+        if (uris.size() < 2 || uris.size() > 7) throw new IllegalArgumentException("Potřeba 2–7 fotek");
         List<Mat> frames = new ArrayList<>();
         Mat reference = new Mat(), coverage = new Mat();
         Mat weighted = new Mat(), weights = new Mat(), output = new Mat();
@@ -27,7 +27,7 @@ final class Fusion {
         try {
             for (int index = 0; index < uris.size(); index++) {
                 checkCancelled();
-                progress.update("读取和对齐 " + (index + 1) + " / " + uris.size());
+                progress.update("Načítám a zarovnávám " + (index + 1) + " / " + uris.size());
                 Bitmap bitmap = ImageLoader.load(resolver, uris.get(index), edge);
                 Mat frame = new Mat();
                 try {
@@ -35,12 +35,12 @@ final class Fusion {
                     Imgproc.cvtColor(frame, frame, Imgproc.COLOR_RGBA2RGB);
                     if (index == 0) {
                         width = frame.cols(); height = frame.rows();
-                        if (width < 32 || height < 32) throw new IllegalArgumentException("照片尺寸过小");
+                        if (width < 32 || height < 32) throw new IllegalArgumentException("Fotka je příliš malá");
                         frame.copyTo(reference);
                         coverage = replace(coverage, new Mat(height, width, CvType.CV_8UC1, Scalar.all(255)));
                     } else {
                         if (frame.cols() != width || frame.rows() != height) {
-                            throw new IllegalArgumentException("请使用相同尺寸、方向的包围照片");
+                            throw new IllegalArgumentException("Použijte fotky ze série se stejnou velikostí a orientací");
                         }
                         if (align) align(reference, frame, coverage);
                     }
@@ -57,12 +57,12 @@ final class Fusion {
             }
             reference.release();
             checkCancelled();
-            progress.update(hdr ? "多尺度曝光融合…" : "融合清晰区域…");
+            progress.update(hdr ? "Slučuji expozice…" : "Skládám ostré oblasti…");
             if (hdr) {
                 MergeMertens merger = Photo.createMergeMertens(1f, 1f, 1f);
                 try {
                     merger.process(frames, output);
-                    // 曝光融合结果为 0～1 浮点 RGB，不是 HDR DNG。
+                    // Výsledek fúze je RGB 0–1 v plovoucí čárce, ne HDR DNG.
                     output.convertTo(output, CvType.CV_8UC3, 255);
                 } finally { merger.clear(); }
             } else {
@@ -76,7 +76,7 @@ final class Fusion {
             checkCancelled();
             Rect crop = largestValidRectangle(coverage);
             if ((long) crop.width * crop.height < (long) width * height / 2) {
-                throw new IllegalArgumentException("有效重叠区域过小，请使用同一组固定机位照片");
+                throw new IllegalArgumentException("Fotky se překrývají příliš málo, použijte sérii ze stejného místa");
             }
             Mat cropped = output.submat(crop), rgba = new Mat();
             try {
@@ -94,7 +94,7 @@ final class Fusion {
     private static Mat replace(Mat old, Mat replacement) { old.release(); return replacement; }
 
     private static void checkCancelled() throws InterruptedException {
-        if (Thread.currentThread().isInterrupted()) throw new InterruptedException("已取消处理");
+        if (Thread.currentThread().isInterrupted()) throw new InterruptedException("Zpracování zrušeno");
     }
 
     private static void align(Mat reference, Mat frame, Mat coverage) {
@@ -112,10 +112,10 @@ final class Fusion {
                 score = Video.findTransformECC(ref, current, transform, Video.MOTION_AFFINE,
                         new TermCriteria(TermCriteria.COUNT | TermCriteria.EPS, 80, 0.0001));
             } catch (CvException error) {
-                throw new IllegalArgumentException("自动对齐失败：请重选同组照片，或三脚架拍摄后关闭对齐", error);
+                throw new IllegalArgumentException("Automatické zarovnání selhalo: vyberte fotky znovu, nebo (u stativu) vypněte zarovnání", error);
             }
             if (!Double.isFinite(score) || score < 0.5) {
-                throw new IllegalArgumentException("照片匹配度过低，请检查所选照片是否为同一组");
+                throw new IllegalArgumentException("Fotky si málo odpovídají, zkontrolujte, že jsou ze stejné série");
             }
             transform.put(0, 2, (float) (transform.get(0, 2)[0] * frame.cols() / small.width));
             transform.put(1, 2, (float) (transform.get(1, 2)[0] * frame.rows() / small.height));
@@ -140,7 +140,7 @@ final class Fusion {
             gray.convertTo(gray, CvType.CV_32F, 1.0 / 255);
             Imgproc.Laplacian(gray, laplacian, CvType.CV_32F, 3);
             Core.multiply(laplacian, laplacian, weight);
-            // 对局部清晰度平滑，缓解逐像素择优产生的接缝；仍可能出现遮挡光晕。
+            // Vyhlazení lokální ostrosti zmírňuje švy; u okrajů předmětů může zůstat svatozář.
             Imgproc.GaussianBlur(weight, weight, new Size(9, 9), 0);
             Core.add(weight, Scalar.all(0.00001), weight);
             Core.merge(java.util.Arrays.asList(weight, weight, weight), rgbWeight);
@@ -153,7 +153,7 @@ final class Fusion {
         }
     }
 
-    /** 单调栈求公共有效区域内最大矩形，裁掉仿射配准带来的黑边。 */
+    /** Největší obdélník ve společné platné oblasti – ořízne černé okraje po zarovnání. */
     private static Rect largestValidRectangle(Mat mask) {
         int width = mask.cols(), height = mask.rows();
         int[] heights = new int[width + 1], stack = new int[width + 1];
