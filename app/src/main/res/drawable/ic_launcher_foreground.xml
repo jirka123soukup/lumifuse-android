@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- Tmavá expozice -->
+    <path android:fillColor="#FF1C1833" android:strokeColor="#FF7C6CC4" android:strokeWidth="1"
+        android:pathData="M36,32h24a5,5 0,0 1,5 5v16a5,5 0,0 1,-5 5h-24a5,5 0,0 1,-5 -5v-16a5,5 0,0 1,5 -5z"/>
+    <!-- Střední expozice -->
+    <path android:fillColor="#FF8E7CD6"
+        android:pathData="M42,40h24a5,5 0,0 1,5 5v16a5,5 0,0 1,-5 5h-24a5,5 0,0 1,-5 -5v-16a5,5 0,0 1,5 -5z"/>
+    <!-- Světlá expozice -->
+    <path android:fillColor="#FFF7F3FF"
+        android:pathData="M48,48h24a5,5 0,0 1,5 5v16a5,5 0,0 1,-5 5h-24a5,5 0,0 1,-5 -5v-16a5,5 0,0 1,5 -5z"/>
+    <!-- Nápis AEB -->
+    <path android:strokeColor="#FF2E2A4F" android:strokeWidth="1.8"
+        android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:pathData="M48,66 L51,56 L54,66 M49.2,62.5 L52.8,62.5 M63,56 L57,56 L57,66 L63,66 M57,61 L62,61 M66,66 L66,56 L70,56 Q72.5,56 72.5,58.5 Q72.5,61 70,61 L66,61 M70,61 L70.5,61 Q73,61 73,63.5 Q73,66 70.5,66 L66,66"/>
+</vector>
