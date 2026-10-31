@@ -412,19 +412,52 @@ public final class MainActivity extends Activity {
                 if (MediaStore.AUTHORITY.equals(uri.getAuthority())) mediaUri = uri;
                 else mediaUri = MediaStore.getMediaUri(this, uri);
             } catch (Exception ignored) { }
-            if (mediaUri != null) media.add(mediaUri); else skipped++;
+            // Záloha pro výběr přes Galerii MIUI apod.: dohledat stejnou fotku v galerii podle jména a velikosti.
+            if (mediaUri == null) mediaUri = findInMediaStore(uri);
+            if (mediaUri != null && !media.contains(mediaUri)) media.add(mediaUri);
+            else if (mediaUri == null) skipped++;
         }
         trashSkipped = skipped;
         if (media.isEmpty()) {
-            status.setText("Uloženo do galerie · originály nejde z aplikace smazat (vyberte je přes Galerii nebo Soubory, ne přes Google Fotky)");
+            status.setText("Uloženo do galerie · originály se nepodařilo v galerii najít, smažte je ručně"
+                    + (checkSelfPermission(readPermission()) != PackageManager.PERMISSION_GRANTED ? " (aplikace nemá povolený přístup k fotkám)" : ""));
             return;
         }
         try {
             PendingIntent request = MediaStore.createTrashRequest(getContentResolver(), media, true);
             startIntentSenderForResult(request.getIntentSender(), TRASH_REQUEST, null, 0, 0, 0);
-        } catch (Exception error) {
-            status.setText("Uloženo do galerie · přesun originálů do koše selhal: " + error.getMessage());
+        } catch (Exception trashError) {
+            // Některé systémy koš nepodporují – pak trvalé smazání, opět se systémovým potvrzením.
+            try {
+                PendingIntent request = MediaStore.createDeleteRequest(getContentResolver(), media);
+                startIntentSenderForResult(request.getIntentSender(), TRASH_REQUEST, null, 0, 0, 0);
+            } catch (Exception deleteError) {
+                status.setText("Uloženo do galerie · smazání originálů selhalo: " + deleteError.getMessage());
+            }
         }
+    }
+
+    /** Najde v galerii (MediaStore) fotku se stejným jménem a velikostí jako vybraný soubor. */
+    private Uri findInMediaStore(Uri uri) {
+        String name = null; long length = -1;
+        try (Cursor cursor = getContentResolver().query(uri,
+                new String[]{OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                name = cursor.getString(0);
+                if (!cursor.isNull(1)) length = cursor.getLong(1);
+            }
+        } catch (Exception ignored) { }
+        if (name == null) return null;
+        String selection = MediaStore.Images.Media.DISPLAY_NAME + "=?" + (length > 0 ? " AND " + MediaStore.Images.Media.SIZE + "=?" : "");
+        String[] args = length > 0 ? new String[]{name, String.valueOf(length)} : new String[]{name};
+        try (Cursor cursor = getContentResolver().query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                new String[]{MediaStore.Images.Media._ID}, selection, args, null)) {
+            // Jen jednoznačná shoda – při víc stejných souborech radši nic nemazat.
+            if (cursor != null && cursor.getCount() == 1 && cursor.moveToFirst()) {
+                return ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cursor.getLong(0));
+            }
+        } catch (Exception ignored) { }
+        return null;
     }
 
     private void onTrashResult(int code) {
