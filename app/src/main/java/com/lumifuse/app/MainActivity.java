@@ -1,11 +1,14 @@
 package com.lumifuse.app;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.app.PendingIntent;
 import android.content.*;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.provider.MediaStore;
 import android.view.View;
@@ -21,11 +24,15 @@ import java.util.concurrent.Executors;
 /** UI, čtení fotek a slučování jsou oddělené; přístup k fotkám jen přes výběr souborů, bez oprávnění k celé galerii. */
 public final class MainActivity extends Activity {
     private static final int PICK_IMAGES = 42;
+    private static final int TRASH_REQUEST = 43;
     /** Delší strana výstupu v px; poslední položka = bez zmenšení (plné rozlišení). */
-    private static final int[] EDGES = {1280, 2048, 3072, 4096, 100000};
+    private static final int[] EDGES = {1280, 2048, 3072, 4096, 5120, 100000};
     /** Náhled na displeji se zmenšuje – příliš velký bitmap by při vykreslení shodil aplikaci. */
     private static final int PREVIEW_EDGE = 2048;
     private final ArrayList<Uri> selected = new ArrayList<>();
+    /** Fotky, ze kterých vznikl aktuální výsledek – jen ty se smí po uložení smazat. */
+    private final ArrayList<Uri> resultInputs = new ArrayList<>();
+    private int trashSkipped;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private Spinner mode, size;
     private CheckBox align;
@@ -69,8 +76,9 @@ public final class MainActivity extends Activity {
                 "Standard · delší strana 2048 px",
                 "Jemné · delší strana 3072 px",
                 "Velké · delší strana 4096 px (hodně paměti)",
-                "Plné rozlišení (pomalé, nejvíc paměti)"});
-        size.setSelection(2); root.addView(size);
+                "Velmi velké · delší strana 5120 px (hodně paměti)",
+                "Plné rozlišení (jen pro 3 snímky, nejvíc paměti)"});
+        size.setSelection(3); root.addView(size);
         align = new CheckBox(this); align.setText("Automaticky zarovnat a oříznout černé okraje"); align.setChecked(true); root.addView(align);
         run = button("Sloučit", root); run.setOnClickListener(view -> process());
         progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
@@ -102,6 +110,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int request, int code, Intent data) {
         super.onActivityResult(request, code, data);
+        if (request == TRASH_REQUEST) { onTrashResult(code); return; }
         if (request != PICK_IMAGES || code != RESULT_OK || data == null) return;
         ArrayList<Uri> incoming = new ArrayList<>();
         if (data.getClipData() != null) {
@@ -142,6 +151,7 @@ public final class MainActivity extends Activity {
                         output.recycle(); source.recycle(); return;
                     }
                     result = output; original = source; shown = display;
+                    resultInputs.clear(); resultInputs.addAll(inputs);
                     preview.setImageBitmap(shown); setBusy(false);
                     status.setText("Hotovo · " + result.getWidth() + " × " + result.getHeight()
                             + " px · " + inputs.size() + " fotek\n"
@@ -179,6 +189,7 @@ public final class MainActivity extends Activity {
     private void saveResult() {
         if (busy || result == null) return;
         final Bitmap image = result;
+        final List<Uri> toTrash = new ArrayList<>(resultInputs);
         setBusy(true); status.setText("Ukládám…");
         worker.execute(() -> {
             Uri uri = null;
@@ -198,7 +209,10 @@ public final class MainActivity extends Activity {
                 values.clear(); values.put(MediaStore.Images.Media.IS_PENDING, 0);
                 if (getContentResolver().update(uri, values, null, null) != 1) throw new IOException("Zveřejnění v galerii selhalo");
                 runOnUiThread(() -> {
-                    if (!isDestroyed()) { setBusy(false); status.setText("Uloženo do galerie · Pictures/LumiFuse · originály beze změny"); }
+                    if (isDestroyed()) return;
+                    setBusy(false);
+                    status.setText("Uloženo do galerie · Pictures/LumiFuse · originály beze změny");
+                    if (!toTrash.isEmpty()) askTrash(toTrash);
                 });
             } catch (Exception error) {
                 // Smaže jen prázdný soubor vytvořený teď, nikdy vstupní fotky.
@@ -210,6 +224,55 @@ public final class MainActivity extends Activity {
                 if (isDestroyed()) image.recycle();
             }
         });
+    }
+
+    private void askTrash(List<Uri> inputs) {
+        new AlertDialog.Builder(this)
+                .setTitle("Fotka uložena")
+                .setMessage("Přesunout " + inputs.size() + " původních fotek do koše?\nVýsledek zůstane v galerii ve složce LumiFuse.")
+                .setPositiveButton("Přesunout do koše", (dialog, which) -> requestTrash(inputs))
+                .setNegativeButton("Ponechat", null)
+                .show();
+    }
+
+    /** Originály se nemažou natrvalo: systém je po potvrzení přesune do koše (lze je obnovit). */
+    private void requestTrash(List<Uri> inputs) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            status.setText("Uloženo do galerie · přesun do koše vyžaduje Android 11 nebo novější, originály zůstaly");
+            return;
+        }
+        ArrayList<Uri> media = new ArrayList<>();
+        int skipped = 0;
+        for (Uri uri : inputs) {
+            Uri mediaUri = null;
+            try {
+                if (MediaStore.AUTHORITY.equals(uri.getAuthority())) mediaUri = uri;
+                else mediaUri = MediaStore.getMediaUri(this, uri);
+            } catch (Exception ignored) { }
+            if (mediaUri != null) media.add(mediaUri); else skipped++;
+        }
+        trashSkipped = skipped;
+        if (media.isEmpty()) {
+            status.setText("Uloženo do galerie · originály nejde z aplikace smazat (vyberte je přes Galerii nebo Soubory, ne přes Google Fotky)");
+            return;
+        }
+        try {
+            PendingIntent request = MediaStore.createTrashRequest(getContentResolver(), media, true);
+            startIntentSenderForResult(request.getIntentSender(), TRASH_REQUEST, null, 0, 0, 0);
+        } catch (Exception error) {
+            status.setText("Uloženo do galerie · přesun originálů do koše selhal: " + error.getMessage());
+        }
+    }
+
+    private void onTrashResult(int code) {
+        if (code == RESULT_OK) {
+            int moved = resultInputs.size() - trashSkipped;
+            selected.clear(); resultInputs.clear();
+            status.setText("Uloženo do galerie · " + moved + " původních fotek přesunuto do koše"
+                    + (trashSkipped > 0 ? " · " + trashSkipped + " nešlo smazat, smažte je ručně" : ""));
+        } else {
+            status.setText("Uloženo do galerie · mazání zrušeno, originály zůstaly");
+        }
     }
 
     private void reportFailure(String message) {
@@ -228,7 +291,7 @@ public final class MainActivity extends Activity {
         if (shown != null && shown != result) shown.recycle();
         if (result != null) result.recycle();
         if (original != null) original.recycle();
-        result = null; original = null; shown = null; showingOriginal = false;
+        result = null; original = null; shown = null; showingOriginal = false; resultInputs.clear();
         save.setEnabled(false); compare.setEnabled(false); compare.setText("Zobrazit originál");
     }
 
