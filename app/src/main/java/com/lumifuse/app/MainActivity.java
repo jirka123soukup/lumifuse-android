@@ -4,44 +4,74 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.PendingIntent;
 import android.content.*;
+import android.content.pm.PackageManager;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
+import android.provider.OpenableColumns;
 import android.view.View;
 import android.widget.*;
+import androidx.exifinterface.media.ExifInterface;
 import org.opencv.android.OpenCVLoader;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
-/** UI, čtení fotek a slučování jsou oddělené; přístup k fotkám jen přes výběr souborů, bez oprávnění k celé galerii. */
+/** UI, čtení fotek a slučování jsou oddělené; vstupní fotky se vybírají přes systémový výběr souborů. */
 public final class MainActivity extends Activity {
     private static final int PICK_IMAGES = 42;
     private static final int TRASH_REQUEST = 43;
+    private static final int PERMISSION_REQUEST = 44;
+    private static final String OUTPUT_FOLDER = "Pictures/LumiFuse/";
     /** Delší strana výstupu v px; poslední položka = bez zmenšení (plné rozlišení). */
     private static final int[] EDGES = {1280, 2048, 3072, 4096, 5120, 100000};
+    /** Značka kvality v názvu souboru – odpovídá položkám EDGES. */
+    private static final String[] QUALITY = {"LQ", "SQ", "HQ", "XQ", "UQ", "FQ"};
     /** Náhled na displeji se zmenšuje – příliš velký bitmap by při vykreslení shodil aplikaci. */
     private static final int PREVIEW_EDGE = 2048;
+    /** EXIF údaje, které se do výsledku přenesou z nejnovější vstupní fotky (bez expozice/ISO – ty by neplatily). */
+    private static final String[] COPY_TAGS = {
+            ExifInterface.TAG_DATETIME_ORIGINAL, ExifInterface.TAG_DATETIME_DIGITIZED, ExifInterface.TAG_DATETIME,
+            ExifInterface.TAG_OFFSET_TIME_ORIGINAL, ExifInterface.TAG_OFFSET_TIME_DIGITIZED, ExifInterface.TAG_OFFSET_TIME,
+            ExifInterface.TAG_SUBSEC_TIME_ORIGINAL, ExifInterface.TAG_SUBSEC_TIME_DIGITIZED, ExifInterface.TAG_SUBSEC_TIME,
+            ExifInterface.TAG_MAKE, ExifInterface.TAG_MODEL, ExifInterface.TAG_LENS_MAKE, ExifInterface.TAG_LENS_MODEL,
+            ExifInterface.TAG_FOCAL_LENGTH, ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, ExifInterface.TAG_F_NUMBER,
+            ExifInterface.TAG_GPS_LATITUDE, ExifInterface.TAG_GPS_LATITUDE_REF,
+            ExifInterface.TAG_GPS_LONGITUDE, ExifInterface.TAG_GPS_LONGITUDE_REF,
+            ExifInterface.TAG_GPS_ALTITUDE, ExifInterface.TAG_GPS_ALTITUDE_REF,
+            ExifInterface.TAG_ARTIST, ExifInterface.TAG_COPYRIGHT};
     private final ArrayList<Uri> selected = new ArrayList<>();
     /** Fotky, ze kterých vznikl aktuální výsledek – jen ty se smí po uložení smazat. */
     private final ArrayList<Uri> resultInputs = new ArrayList<>();
-    private int trashSkipped;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private Spinner mode, size;
     private CheckBox align;
-    private Button pick, run, save, compare;
+    private Button pick, run, cancel, save, compare;
     private TextView status;
     private ImageView preview;
     private ProgressBar progress;
     private Bitmap result, original, shown;
-    private boolean busy, showingOriginal;
+    private String resultName;
+    private Map<String, String> resultExif;
+    private boolean busy, showingOriginal, permissionAsked;
+    private int trashSkipped;
+    /** Každé spuštění slučování dostane číslo; po zrušení se pozdní výsledky starého běhu zahodí. */
+    private int generation;
+    private Future<?> task;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -72,15 +102,17 @@ public final class MainActivity extends Activity {
         mode = spinner(new String[]{"HDR · různé expozice", "Hloubka ostrosti · různé zaostření"}); root.addView(mode);
         pick = button("Vybrat 2–7 fotek JPG", root); pick.setOnClickListener(view -> pickImages());
         size = spinner(new String[]{
-                "Rychlé · delší strana 1280 px",
-                "Standard · delší strana 2048 px",
-                "Jemné · delší strana 3072 px",
-                "Velké · delší strana 4096 px (hodně paměti)",
-                "Velmi velké · delší strana 5120 px (hodně paměti)",
-                "Plné rozlišení (jen pro 3 snímky, nejvíc paměti)"});
+                "LQ · rychlé · delší strana 1280 px",
+                "SQ · standard · delší strana 2048 px",
+                "HQ · jemné · delší strana 3072 px",
+                "XQ · velké · delší strana 4096 px (hodně paměti)",
+                "UQ · velmi velké · delší strana 5120 px (hodně paměti)",
+                "FQ · plné rozlišení (jen pro 3 snímky, nejvíc paměti)"});
         size.setSelection(3); root.addView(size);
         align = new CheckBox(this); align.setText("Automaticky zarovnat a oříznout černé okraje"); align.setChecked(true); root.addView(align);
-        run = button("Sloučit", root); run.setOnClickListener(view -> process());
+        run = button("Sloučit", root); run.setOnClickListener(view -> process(false));
+        cancel = button("Zrušit slučování", root); cancel.setVisibility(View.GONE);
+        cancel.setOnClickListener(view -> cancelMerge());
         progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progress.setIndeterminate(true); progress.setVisibility(View.GONE); root.addView(progress);
         status = label(selected.isEmpty() ? "Zatím nevybrány žádné fotky · zpracování offline · nic se nenahrává"
@@ -130,29 +162,98 @@ public final class MainActivity extends Activity {
         status.setText("Vybráno " + selected.size() + " fotek · HDR = různé expozice, hloubka ostrosti = různé zaostření");
     }
 
-    private void process() {
+    // ---------- Kontrola, zda už byla série sloučena ----------
+
+    private String readPermission() {
+        return Build.VERSION.SDK_INT >= 33 ? "android.permission.READ_MEDIA_IMAGES"
+                : "android.permission.READ_EXTERNAL_STORAGE";
+    }
+
+    @Override public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(request, permissions, results);
+        // I při odmítnutí se pokračuje – kontrola pak uvidí jen soubory uložené touto instalací.
+        if (request == PERMISSION_REQUEST) process(false);
+    }
+
+    /** Název výstupu podle vstupních souborů, např. DSC01234-DSC01238_HDR (značka kvality se přidá zvlášť). */
+    private String outputName(List<Uri> inputs, boolean hdr) {
+        ArrayList<String> names = new ArrayList<>();
+        for (Uri uri : inputs) {
+            String name = displayName(uri);
+            if (name == null || name.isEmpty()) name = "foto";
+            int dot = name.lastIndexOf('.');
+            if (dot > 0) name = name.substring(0, dot);
+            names.add(name.replaceAll("[\\\\/:*?\"<>|]", "_"));
+        }
+        Collections.sort(names);
+        String first = names.get(0), last = names.get(names.size() - 1);
+        return (first.equals(last) ? first : first + "-" + last) + (hdr ? "_HDR" : "_OSTROST");
+    }
+
+    private String displayName(Uri uri) {
+        try (Cursor cursor = getContentResolver().query(uri,
+                new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) return cursor.getString(0);
+        } catch (Exception ignored) { }
+        return null;
+    }
+
+    private boolean existsInGallery(String fileName) {
+        try (Cursor cursor = getContentResolver().query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                new String[]{MediaStore.Images.Media._ID},
+                MediaStore.Images.Media.DISPLAY_NAME + "=? AND " + MediaStore.Images.Media.RELATIVE_PATH + "=?",
+                new String[]{fileName, OUTPUT_FOLDER}, null)) {
+            return cursor != null && cursor.moveToFirst();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    // ---------- Slučování ----------
+
+    private void process(boolean confirmedRedo) {
         if (busy) return;
         if (selected.size() < 2) { status.setText("Nejdřív vyberte 2–7 fotek JPG"); return; }
+        if (!permissionAsked && checkSelfPermission(readPermission()) != PackageManager.PERMISSION_GRANTED) {
+            permissionAsked = true;
+            status.setText("Povolte přístup k fotkám, aby aplikace poznala už sloučené série");
+            requestPermissions(new String[]{readPermission()}, PERMISSION_REQUEST);
+            return;
+        }
         final List<Uri> inputs = new ArrayList<>(selected);
         final int edge = EDGES[size.getSelectedItemPosition()];
         final boolean hdr = mode.getSelectedItemPosition() == 0, useAlignment = align.isChecked();
-        clearResult(); setBusy(true); status.setText("Připravuji…");
-        worker.execute(() -> {
+        final String name = outputName(inputs, hdr) + "_" + QUALITY[size.getSelectedItemPosition()];
+        if (!confirmedRedo && existsInGallery(name + ".jpg")) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Už sloučeno")
+                    .setMessage("Tahle série už je v galerii jako " + name + ".jpg.\nSloučit ji znovu? Nový soubor dostane číslo, původní zůstane.")
+                    .setPositiveButton("Sloučit znovu", (dialog, which) -> process(true))
+                    .setNegativeButton("Zrušit", null)
+                    .show();
+            return;
+        }
+        clearResult(); setBusy(true); cancel.setVisibility(View.VISIBLE); status.setText("Připravuji…");
+        final int gen = ++generation;
+        task = worker.submit(() -> {
             Bitmap fused = null, first = null, small = null;
             try {
                 fused = Fusion.merge(getContentResolver(), inputs, edge, hdr, useAlignment,
-                        message -> runOnUiThread(() -> { if (!isDestroyed()) status.setText(message); }));
+                        message -> runOnUiThread(() -> { if (!isDestroyed() && gen == generation) status.setText(message); }));
+                if (Thread.currentThread().isInterrupted()) throw new InterruptedException("Zpracování zrušeno");
                 small = scaledForPreview(fused);
                 first = ImageLoader.load(getContentResolver(), inputs.get(0), 1280);
+                final Map<String, String> exif = newestExif(inputs);
+                if (Thread.currentThread().isInterrupted()) throw new InterruptedException("Zpracování zrušeno");
                 final Bitmap output = fused, source = first, display = small;
                 runOnUiThread(() -> {
-                    if (isDestroyed()) {
+                    if (isDestroyed() || gen != generation) {
                         if (display != output) display.recycle();
                         output.recycle(); source.recycle(); return;
                     }
-                    result = output; original = source; shown = display;
+                    result = output; original = source; shown = display; resultName = name; resultExif = exif;
                     resultInputs.clear(); resultInputs.addAll(inputs);
-                    preview.setImageBitmap(shown); setBusy(false);
+                    preview.setImageBitmap(shown); cancel.setVisibility(View.GONE); setBusy(false);
                     status.setText("Hotovo · " + result.getWidth() + " × " + result.getHeight()
                             + " px · " + inputs.size() + " fotek\n"
                             + (hdr ? "Expoziční fúze do JPG (ne HDR DNG)" : "Hloubka ostrosti: u okrajů předmětů může vzniknout svatozář"));
@@ -161,11 +262,52 @@ public final class MainActivity extends Activity {
                 if (small != null && small != fused) small.recycle();
                 if (fused != null) fused.recycle();
                 if (first != null) first.recycle();
-                reportFailure(isMemoryError(error)
+                final String message = isMemoryError(error)
                         ? "Došla paměť – zvolte menší velikost výstupu nebo méně fotek"
-                        : error.getMessage());
+                        : error.getMessage();
+                runOnUiThread(() -> {
+                    if (isDestroyed() || gen != generation) return;
+                    cancel.setVisibility(View.GONE); setBusy(false);
+                    status.setText("Nedokončeno: " + message);
+                });
             }
         });
+    }
+
+    /** Zruší běžící slučování. Rozpracovaný krok v knihovně OpenCV se dokončí na pozadí a výsledek se zahodí. */
+    private void cancelMerge() {
+        generation++;
+        if (task != null) task.cancel(true);
+        task = null;
+        cancel.setVisibility(View.GONE); setBusy(false);
+        status.setText("Slučování zrušeno");
+    }
+
+    /** Načte EXIF ze všech vstupů a vrátí údaje té fotky, která byla pořízena nejpozději. */
+    private Map<String, String> newestExif(List<Uri> inputs) {
+        Map<String, String> best = new HashMap<>();
+        String bestDate = null;
+        for (Uri uri : inputs) {
+            try (InputStream input = getContentResolver().openInputStream(uri)) {
+                if (input == null) continue;
+                ExifInterface exif = new ExifInterface(input);
+                String date = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL);
+                if (date == null) date = exif.getAttribute(ExifInterface.TAG_DATETIME);
+                if (date == null) continue;
+                String subsec = exif.getAttribute(ExifInterface.TAG_SUBSEC_TIME_ORIGINAL);
+                // Formát „yyyy:MM:dd HH:mm:ss“ jde porovnávat jako text.
+                String key = date + "." + (subsec != null ? subsec : "");
+                if (bestDate == null || key.compareTo(bestDate) > 0) {
+                    bestDate = key;
+                    best = new HashMap<>();
+                    for (String tag : COPY_TAGS) {
+                        String value = exif.getAttribute(tag);
+                        if (value != null) best.put(tag, value);
+                    }
+                }
+            } catch (Exception ignored) { }
+        }
+        return best;
     }
 
     private static boolean isMemoryError(Throwable error) {
@@ -186,18 +328,23 @@ public final class MainActivity extends Activity {
                 Math.max(1, Math.round(source.getHeight() * scale)), true);
     }
 
+    // ---------- Uložení a mazání originálů ----------
+
     private void saveResult() {
         if (busy || result == null) return;
         final Bitmap image = result;
+        final String fileName = (resultName != null ? resultName : "LumiFuse_" + System.currentTimeMillis()) + ".jpg";
         final List<Uri> toTrash = new ArrayList<>(resultInputs);
+        final Map<String, String> exif = resultExif != null ? new HashMap<>(resultExif) : new HashMap<>();
         setBusy(true); status.setText("Ukládám…");
         worker.execute(() -> {
             Uri uri = null;
             try {
                 ContentValues values = new ContentValues();
-                values.put(MediaStore.Images.Media.DISPLAY_NAME, "LumiFuse_" + System.currentTimeMillis() + ".jpg");
+                // Pokud už soubor stejného jména existuje, systém novému přidá číslo – nic se nepřepíše.
+                values.put(MediaStore.Images.Media.DISPLAY_NAME, fileName);
                 values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
-                values.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/LumiFuse");
+                values.put(MediaStore.Images.Media.RELATIVE_PATH, OUTPUT_FOLDER);
                 values.put(MediaStore.Images.Media.IS_PENDING, 1);
                 uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
                 if (uri == null) throw new IOException("V galerii se nepodařilo vytvořit soubor");
@@ -206,12 +353,27 @@ public final class MainActivity extends Activity {
                         throw new IOException("Zápis JPG selhal");
                     }
                 }
+                boolean dateCopied = false;
+                if (!exif.isEmpty()) {
+                    // Datum a údaje o fotoaparátu z nejnovější vstupní fotky – galerie výsledek zařadí jako nejnovější ze série.
+                    try (ParcelFileDescriptor fd = getContentResolver().openFileDescriptor(uri, "rw")) {
+                        if (fd != null) {
+                            ExifInterface out = new ExifInterface(fd.getFileDescriptor());
+                            for (Map.Entry<String, String> entry : exif.entrySet()) out.setAttribute(entry.getKey(), entry.getValue());
+                            out.setAttribute(ExifInterface.TAG_ORIENTATION, String.valueOf(ExifInterface.ORIENTATION_NORMAL));
+                            out.setAttribute(ExifInterface.TAG_SOFTWARE, "LumiFuse");
+                            out.saveAttributes();
+                            dateCopied = exif.containsKey(ExifInterface.TAG_DATETIME_ORIGINAL) || exif.containsKey(ExifInterface.TAG_DATETIME);
+                        }
+                    } catch (Exception ignored) { /* Bez EXIF se fotka uloží i tak, jen s dnešním datem. */ }
+                }
+                final String dateNote = dateCopied ? " · datum podle nejnovější fotky" : " · datum se nepodařilo přenést";
                 values.clear(); values.put(MediaStore.Images.Media.IS_PENDING, 0);
                 if (getContentResolver().update(uri, values, null, null) != 1) throw new IOException("Zveřejnění v galerii selhalo");
                 runOnUiThread(() -> {
                     if (isDestroyed()) return;
                     setBusy(false);
-                    status.setText("Uloženo do galerie · Pictures/LumiFuse · originály beze změny");
+                    status.setText("Uloženo do galerie · " + OUTPUT_FOLDER + fileName + dateNote + " · originály beze změny");
                     if (!toTrash.isEmpty()) askTrash(toTrash);
                 });
             } catch (Exception error) {
@@ -219,7 +381,8 @@ public final class MainActivity extends Activity {
                 if (uri != null) {
                     try { getContentResolver().delete(uri, null, null); } catch (Exception ignored) { }
                 }
-                reportFailure("Uložení selhalo: " + error.getMessage());
+                final String message = "Uložení selhalo: " + error.getMessage();
+                runOnUiThread(() -> { if (!isDestroyed()) { setBusy(false); status.setText(message); } });
             } finally {
                 if (isDestroyed()) image.recycle();
             }
@@ -275,9 +438,7 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void reportFailure(String message) {
-        runOnUiThread(() -> { if (!isDestroyed()) { setBusy(false); status.setText("Nedokončeno: " + message); } });
-    }
+    // ---------- Pomocné ----------
 
     private void setBusy(boolean value) {
         busy = value; pick.setEnabled(!value); run.setEnabled(!value);
@@ -291,7 +452,8 @@ public final class MainActivity extends Activity {
         if (shown != null && shown != result) shown.recycle();
         if (result != null) result.recycle();
         if (original != null) original.recycle();
-        result = null; original = null; shown = null; showingOriginal = false; resultInputs.clear();
+        result = null; original = null; shown = null; resultName = null; resultExif = null; showingOriginal = false;
+        resultInputs.clear();
         save.setEnabled(false); compare.setEnabled(false); compare.setText("Zobrazit originál");
     }
 
@@ -302,6 +464,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        generation++;
         worker.shutdownNow();
         // Pokud výsledek právě ukládá vlákno, uvolní ho to vlákno samo.
         if (shown != null && shown != result) shown.recycle();
