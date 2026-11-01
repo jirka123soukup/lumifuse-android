@@ -415,7 +415,8 @@ public final class MainActivity extends Activity {
                 // Odkazy z výběru fotek Androidu (content://media/picker/…) nejsou položky galerie – ty se dohledají níž.
                 else if (!MediaStore.AUTHORITY.equals(uri.getAuthority())) mediaUri = MediaStore.getMediaUri(this, uri);
             } catch (Exception ignored) { }
-            if (mediaUri != null && !isMediaItem(mediaUri)) mediaUri = null;
+            // Odkaz typu …/file/ID systém ke smazání nepřijme („must be Media items“) – převést na …/images/media/ID.
+            mediaUri = toImageItem(mediaUri);
             // Záloha pro výběr přes Galerii MIUI apod.: dohledat stejnou fotku v galerii podle jména a velikosti.
             if (mediaUri == null) mediaUri = findInMediaStore(uri);
             if (mediaUri != null && !media.contains(mediaUri)) media.add(mediaUri);
@@ -437,7 +438,8 @@ public final class MainActivity extends Activity {
                 PendingIntent request = MediaStore.createDeleteRequest(getContentResolver(), media);
                 startIntentSenderForResult(request.getIntentSender(), TRASH_REQUEST, null, 0, 0, 0);
             } catch (Exception deleteError) {
-                status.setText("Uloženo do galerie · smazání originálů selhalo: " + deleteError.getMessage());
+                status.setText("Uloženo do galerie · smazání originálů selhalo: " + deleteError.getMessage()
+                        + "\n(" + media.get(0) + ")");
             }
         }
     }
@@ -452,7 +454,23 @@ public final class MainActivity extends Activity {
             String type = segments.get(1);
             return "images".equals(type) || "video".equals(type) || "audio".equals(type);
         }
-        return segments.size() == 3 && "file".equals(segments.get(1));
+        return false;
+    }
+
+    /** Vrátí odkaz ve tvaru …/images/media/ID (nebo jiný přímý odkaz na médium), nebo null. */
+    private Uri toImageItem(Uri uri) {
+        if (uri == null || !MediaStore.AUTHORITY.equals(uri.getAuthority())) return null;
+        if (isMediaItem(uri)) return uri;
+        List<String> segments = uri.getPathSegments();
+        if (segments.size() == 3 && "file".equals(segments.get(1)) && segments.get(2).matches("\\d+")) {
+            Uri image = ContentUris.withAppendedId(MediaStore.Images.Media.getContentUri(segments.get(0)),
+                    Long.parseLong(segments.get(2)));
+            try (Cursor cursor = getContentResolver().query(image,
+                    new String[]{MediaStore.Images.Media._ID}, null, null, null)) {
+                if (cursor != null && cursor.moveToFirst()) return image;
+            } catch (Exception ignored) { }
+        }
+        return null;
     }
 
     /** Najde v galerii (MediaStore) fotku se stejným jménem a velikostí jako vybraný soubor. */
