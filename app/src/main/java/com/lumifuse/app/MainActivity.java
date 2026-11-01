@@ -12,9 +12,12 @@ import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
+import android.content.SharedPreferences;
 import android.view.View;
 import android.widget.*;
 import androidx.exifinterface.media.ExifInterface;
@@ -75,6 +78,22 @@ public final class MainActivity extends Activity {
     private int generation;
     private Future<?> task;
 
+    // ---------- Úpravy po sloučení ----------
+    private static final String[] ADJ_NAMES = {"Komprese dynamiky", "Stíny", "Světla", "Expozice",
+            "Kontrast", "Sytost", "Teplota", "Doostření"};
+    private static final boolean[] ADJ_BIPOLAR = {false, true, true, true, true, true, true, false};
+    private final int[] adj = new int[ADJ_NAMES.length];
+    private final SeekBar[] adjBars = new SeekBar[ADJ_NAMES.length];
+    private final TextView[] adjLabels = new TextView[ADJ_NAMES.length];
+    private ScrollView adjustPanel;
+    private Button adjustToggle;
+    /** Zmenšená kopie výsledku pro rychlý náhled úprav a upravený náhled. Neuvolňují se ručně (souběh s vláknem). */
+    private Bitmap adjustBase, adjustedPreview;
+    private int previewSeq;
+    private final ExecutorService previewWorker = Executors.newSingleThreadExecutor();
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final Runnable previewRunnable = this::renderPreview;
+
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         if (state != null) {
@@ -120,15 +139,22 @@ public final class MainActivity extends Activity {
         status = label(selected.isEmpty() ? "Zatím nevybrány žádné fotky · zpracování offline · nic se nenahrává"
                 : "Obnoveno " + selected.size() + " fotek, spusťte slučování znovu", 13);
         root.addView(status);
+        buildAdjustPanel(root);
         preview = new ImageView(this); preview.setScaleType(ImageView.ScaleType.FIT_CENTER);
         preview.setContentDescription("Náhled fotky");
         root.addView(preview, new LinearLayout.LayoutParams(-1, 0, 1));
         LinearLayout actions = new LinearLayout(this);
-        compare = button("Zobrazit originál", actions); compare.setEnabled(false);
+        compare = button("Originál", actions); compare.setEnabled(false);
         compare.setOnClickListener(view -> {
             showingOriginal = !showingOriginal;
-            preview.setImageBitmap(showingOriginal ? original : shown);
-            compare.setText(showingOriginal ? "Zobrazit výsledek" : "Zobrazit originál");
+            preview.setImageBitmap(showingOriginal ? original : displayed());
+            compare.setText(showingOriginal ? "Výsledek" : "Originál");
+        });
+        adjustToggle = button("Úpravy", actions);
+        adjustToggle.setOnClickListener(view -> {
+            boolean show = adjustPanel.getVisibility() != View.VISIBLE;
+            adjustPanel.setVisibility(show ? View.VISIBLE : View.GONE);
+            adjustToggle.setText(show ? "Skrýt úpravy" : "Úpravy");
         });
         save = button("Uložit JPG", actions); save.setEnabled(false);
         save.setOnClickListener(view -> saveResult()); root.addView(actions);
@@ -244,6 +270,7 @@ public final class MainActivity extends Activity {
                         message -> runOnUiThread(() -> { if (!isDestroyed() && gen == generation) status.setText(message); }));
                 if (Thread.currentThread().isInterrupted()) throw new InterruptedException("Zpracování zrušeno");
                 small = scaledForPreview(fused);
+                final Bitmap adjSource = scaledCopy(fused, 1280);
                 first = ImageLoader.load(getContentResolver(), inputs.get(0), 1280);
                 final Map<String, String> exif = newestExif(inputs);
                 if (Thread.currentThread().isInterrupted()) throw new InterruptedException("Zpracování zrušeno");
@@ -254,8 +281,10 @@ public final class MainActivity extends Activity {
                         output.recycle(); source.recycle(); return;
                     }
                     result = output; original = source; shown = display; resultName = name; resultExif = exif;
+                    adjustBase = adjSource; adjustedPreview = null;
                     resultInputs.clear(); resultInputs.addAll(inputs);
                     preview.setImageBitmap(shown); cancel.setVisibility(View.GONE); setBusy(false);
+                    schedulePreview();
                     status.setText("Hotovo · " + result.getWidth() + " × " + result.getHeight()
                             + " px · " + inputs.size() + " fotek\n"
                             + (hdr ? "Expoziční fúze do JPG (ne HDR DNG)" : "Hloubka ostrosti: u okrajů předmětů může vzniknout svatozář"));
@@ -338,10 +367,14 @@ public final class MainActivity extends Activity {
         final String fileName = (resultName != null ? resultName : "LumiFuse_" + System.currentTimeMillis()) + ".jpg";
         final List<Uri> toTrash = new ArrayList<>(resultInputs);
         final Map<String, String> exif = resultExif != null ? new HashMap<>(resultExif) : new HashMap<>();
-        setBusy(true); status.setText("Ukládám…");
+        final Adjust.Params params = currentParams();
+        final boolean adjusted = !params.isNeutral();
+        setBusy(true); status.setText(adjusted ? "Upravuji a ukládám…" : "Ukládám…");
         worker.execute(() -> {
             Uri uri = null;
+            Bitmap toSave = image;
             try {
+                if (adjusted) toSave = Adjust.apply(image, params, 1.0);
                 ContentValues values = new ContentValues();
                 // Pokud už soubor stejného jména existuje, systém novému přidá číslo – nic se nepřepíše.
                 values.put(MediaStore.Images.Media.DISPLAY_NAME, fileName);
@@ -351,7 +384,7 @@ public final class MainActivity extends Activity {
                 uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
                 if (uri == null) throw new IOException("V galerii se nepodařilo vytvořit soubor");
                 try (OutputStream output = getContentResolver().openOutputStream(uri)) {
-                    if (output == null || !image.compress(Bitmap.CompressFormat.JPEG, 95, output)) {
+                    if (output == null || !toSave.compress(Bitmap.CompressFormat.JPEG, 95, output)) {
                         throw new IOException("Zápis JPG selhal");
                     }
                 }
@@ -375,17 +408,19 @@ public final class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     if (isDestroyed()) return;
                     setBusy(false);
-                    status.setText("Uloženo do galerie · " + OUTPUT_FOLDER + fileName + dateNote + " · originály beze změny");
+                    status.setText("Uloženo do galerie · " + OUTPUT_FOLDER + fileName + dateNote + (adjusted ? " · s úpravami" : "") + " · originály beze změny");
                     if (!toTrash.isEmpty()) askTrash(toTrash);
                 });
-            } catch (Exception error) {
+            } catch (Exception | OutOfMemoryError error) {
                 // Smaže jen prázdný soubor vytvořený teď, nikdy vstupní fotky.
                 if (uri != null) {
                     try { getContentResolver().delete(uri, null, null); } catch (Exception ignored) { }
                 }
-                final String message = "Uložení selhalo: " + error.getMessage();
+                final String message = "Uložení selhalo: " + (isMemoryError(error)
+                        ? "došla paměť při úpravách – zkuste menší velikost výstupu" : error.getMessage());
                 runOnUiThread(() -> { if (!isDestroyed()) { setBusy(false); status.setText(message); } });
             } finally {
+                if (toSave != image) toSave.recycle();
                 if (isDestroyed()) image.recycle();
             }
         });
@@ -526,6 +561,113 @@ public final class MainActivity extends Activity {
         }
     }
 
+    // ---------- Panel úprav ----------
+
+    private void buildAdjustPanel(LinearLayout root) {
+        SharedPreferences prefs = getSharedPreferences("upravy", MODE_PRIVATE);
+        adjustPanel = new ScrollView(this);
+        adjustPanel.setVisibility(View.GONE);
+        LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        for (int i = 0; i < ADJ_NAMES.length; i++) {
+            final int index = i;
+            adj[i] = prefs.getInt("a" + i, 0);
+            adjLabels[i] = label("", 13);
+            list.addView(adjLabels[i]);
+            SeekBar bar = new SeekBar(this);
+            bar.setMax(ADJ_BIPOLAR[i] ? 200 : 100);
+            bar.setProgress(ADJ_BIPOLAR[i] ? adj[i] + 100 : adj[i]);
+            bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                    adj[index] = ADJ_BIPOLAR[index] ? progress - 100 : progress;
+                    updateAdjustLabel(index);
+                    if (fromUser) { saveAdjustments(); schedulePreview(); }
+                }
+                @Override public void onStartTrackingTouch(SeekBar seekBar) { }
+                @Override public void onStopTrackingTouch(SeekBar seekBar) { }
+            });
+            adjBars[i] = bar;
+            list.addView(bar);
+            updateAdjustLabel(i);
+        }
+        Button reset = button("Vynulovat úpravy", list);
+        reset.setOnClickListener(view -> {
+            for (int i = 0; i < ADJ_NAMES.length; i++) {
+                adj[i] = 0;
+                adjBars[i].setProgress(ADJ_BIPOLAR[i] ? 100 : 0);
+            }
+            saveAdjustments(); schedulePreview();
+        });
+        adjustPanel.addView(list);
+        root.addView(adjustPanel, new LinearLayout.LayoutParams(-1, dp(240)));
+    }
+
+    private void updateAdjustLabel(int i) {
+        String value = ADJ_BIPOLAR[i] && adj[i] > 0 ? "+" + adj[i] : String.valueOf(adj[i]);
+        adjLabels[i].setText(ADJ_NAMES[i] + ": " + value);
+    }
+
+    private void saveAdjustments() {
+        SharedPreferences.Editor editor = getSharedPreferences("upravy", MODE_PRIVATE).edit();
+        for (int i = 0; i < adj.length; i++) editor.putInt("a" + i, adj[i]);
+        editor.apply();
+    }
+
+    /** Převod posuvníků na parametry úprav. */
+    private Adjust.Params currentParams() {
+        Adjust.Params p = new Adjust.Params();
+        p.compression = adj[0] / 100f * 0.7f;
+        p.shadows = adj[1] / 100f;
+        p.highlights = adj[2] / 100f;
+        p.exposure = adj[3] / 100f * 1.5f;
+        p.contrast = adj[4] / 100f * 0.5f;
+        p.saturation = adj[5] / 100f * 0.8f;
+        p.warmth = adj[6] / 100f;
+        p.sharpness = adj[7] / 100f * 1.5f;
+        return p;
+    }
+
+    private Bitmap displayed() { return adjustedPreview != null ? adjustedPreview : shown; }
+
+    private void schedulePreview() {
+        handler.removeCallbacks(previewRunnable);
+        handler.postDelayed(previewRunnable, 150);
+    }
+
+    /** Přepočítá náhled úprav na pozadí; zastaralé výsledky (posuvník se mezitím pohnul) se zahodí. */
+    private void renderPreview() {
+        final Bitmap base = adjustBase;
+        if (base == null || result == null) return;
+        final Adjust.Params p = currentParams();
+        final int seq = ++previewSeq;
+        if (p.isNeutral()) {
+            adjustedPreview = null;
+            if (!showingOriginal) preview.setImageBitmap(shown);
+            return;
+        }
+        final double scale = (double) Math.max(base.getWidth(), base.getHeight())
+                / Math.max(result.getWidth(), result.getHeight());
+        previewWorker.execute(() -> {
+            try {
+                final Bitmap out = Adjust.apply(base, p, scale);
+                runOnUiThread(() -> {
+                    if (isDestroyed() || seq != previewSeq || base != adjustBase) return;
+                    adjustedPreview = out;
+                    if (!showingOriginal) preview.setImageBitmap(adjustedPreview);
+                });
+            } catch (Exception | OutOfMemoryError ignored) { }
+        });
+    }
+
+    private static Bitmap scaledCopy(Bitmap source, int edge) {
+        int longest = Math.max(source.getWidth(), source.getHeight());
+        if (longest <= edge) return source.copy(Bitmap.Config.ARGB_8888, false);
+        float scale = (float) edge / longest;
+        return Bitmap.createScaledBitmap(source,
+                Math.max(1, Math.round(source.getWidth() * scale)),
+                Math.max(1, Math.round(source.getHeight() * scale)), true);
+    }
+
     // ---------- Pomocné ----------
 
     private void setBusy(boolean value) {
@@ -541,8 +683,9 @@ public final class MainActivity extends Activity {
         if (result != null) result.recycle();
         if (original != null) original.recycle();
         result = null; original = null; shown = null; resultName = null; resultExif = null; showingOriginal = false;
+        adjustBase = null; adjustedPreview = null; previewSeq++;
         resultInputs.clear();
-        save.setEnabled(false); compare.setEnabled(false); compare.setText("Zobrazit originál");
+        save.setEnabled(false); compare.setEnabled(false); compare.setText("Originál");
     }
 
     @Override protected void onSaveInstanceState(Bundle state) {
@@ -554,6 +697,8 @@ public final class MainActivity extends Activity {
     @Override protected void onDestroy() {
         generation++;
         worker.shutdownNow();
+        previewWorker.shutdownNow();
+        handler.removeCallbacks(previewRunnable);
         // Pokud výsledek právě ukládá vlákno, uvolní ho to vlákno samo.
         if (shown != null && shown != result) shown.recycle();
         if (!busy && result != null) result.recycle();
