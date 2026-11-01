@@ -411,9 +411,11 @@ public final class MainActivity extends Activity {
         for (Uri uri : inputs) {
             Uri mediaUri = null;
             try {
-                if (MediaStore.AUTHORITY.equals(uri.getAuthority())) mediaUri = uri;
-                else mediaUri = MediaStore.getMediaUri(this, uri);
+                if (isMediaItem(uri)) mediaUri = uri;
+                // Odkazy z výběru fotek Androidu (content://media/picker/…) nejsou položky galerie – ty se dohledají níž.
+                else if (!MediaStore.AUTHORITY.equals(uri.getAuthority())) mediaUri = MediaStore.getMediaUri(this, uri);
             } catch (Exception ignored) { }
+            if (mediaUri != null && !isMediaItem(mediaUri)) mediaUri = null;
             // Záloha pro výběr přes Galerii MIUI apod.: dohledat stejnou fotku v galerii podle jména a velikosti.
             if (mediaUri == null) mediaUri = findInMediaStore(uri);
             if (mediaUri != null && !media.contains(mediaUri)) media.add(mediaUri);
@@ -438,6 +440,19 @@ public final class MainActivity extends Activity {
                 status.setText("Uloženo do galerie · smazání originálů selhalo: " + deleteError.getMessage());
             }
         }
+    }
+
+    /** Je to přímý odkaz na položku galerie, např. content://media/external_primary/images/media/123? */
+    private static boolean isMediaItem(Uri uri) {
+        if (uri == null || !MediaStore.AUTHORITY.equals(uri.getAuthority())) return false;
+        List<String> segments = uri.getPathSegments();
+        String last = segments.isEmpty() ? "" : segments.get(segments.size() - 1);
+        if (!last.matches("\\d+")) return false;
+        if (segments.size() == 4 && "media".equals(segments.get(2))) {
+            String type = segments.get(1);
+            return "images".equals(type) || "video".equals(type) || "audio".equals(type);
+        }
+        return segments.size() == 3 && "file".equals(segments.get(1));
     }
 
     /** Najde v galerii (MediaStore) fotku se stejným jménem a velikostí jako vybraný soubor. */
