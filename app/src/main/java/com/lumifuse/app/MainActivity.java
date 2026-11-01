@@ -69,6 +69,8 @@ public final class MainActivity extends Activity {
     private Map<String, String> resultExif;
     private boolean busy, showingOriginal, permissionAsked;
     private int trashSkipped;
+    /** Fotky (v galerii), u kterých se čeká na systémové potvrzení přesunu do koše. */
+    private final ArrayList<Uri> pendingTrash = new ArrayList<>();
     /** Každé spuštění slučování dostane číslo; po zrušení se pozdní výsledky starého běhu zahodí. */
     private int generation;
     private Future<?> task;
@@ -418,6 +420,7 @@ public final class MainActivity extends Activity {
             else if (mediaUri == null) skipped++;
         }
         trashSkipped = skipped;
+        pendingTrash.clear(); pendingTrash.addAll(media);
         if (media.isEmpty()) {
             status.setText("Uloženo do galerie · originály se nepodařilo v galerii najít, smažte je ručně"
                     + (checkSelfPermission(readPermission()) != PackageManager.PERMISSION_GRANTED ? " (aplikace nemá povolený přístup k fotkám)" : ""));
@@ -460,14 +463,33 @@ public final class MainActivity extends Activity {
         return null;
     }
 
+    /** Po odpovědi systému se ověří, kolik fotek je opravdu v koši – výsledek se vypíše do stavového řádku. */
     private void onTrashResult(int code) {
-        if (code == RESULT_OK) {
-            int moved = resultInputs.size() - trashSkipped;
+        int total = pendingTrash.size(), gone = 0;
+        for (Uri uri : pendingTrash) if (isTrashedOrGone(uri)) gone++;
+        pendingTrash.clear();
+        String skippedNote = trashSkipped > 0 ? " · " + trashSkipped + " se nepodařilo najít, smažte je ručně" : "";
+        if (gone == total && total > 0) {
             selected.clear(); resultInputs.clear();
-            status.setText("Uloženo do galerie · " + moved + " původních fotek přesunuto do koše"
-                    + (trashSkipped > 0 ? " · " + trashSkipped + " nešlo smazat, smažte je ručně" : ""));
+            status.setText("Uloženo do galerie · " + gone + " původních fotek přesunuto do koše" + skippedNote);
+        } else if (code == RESULT_OK) {
+            status.setText("Uloženo · systém přesun potvrdil, ale v koši je jen " + gone + " z " + total
+                    + " fotek. Ostatní zůstaly." + skippedNote);
         } else {
-            status.setText("Uloženo do galerie · mazání zrušeno, originály zůstaly");
+            status.setText("Uloženo · systém přesun do koše nepotvrdil (odpověď " + code + "), v koši "
+                    + gone + " z " + total + " fotek." + skippedNote);
+        }
+    }
+
+    private boolean isTrashedOrGone(Uri uri) {
+        Bundle args = new Bundle();
+        args.putInt(MediaStore.QUERY_ARG_MATCH_TRASHED, MediaStore.MATCH_INCLUDE);
+        try (Cursor cursor = getContentResolver().query(uri,
+                new String[]{MediaStore.MediaColumns.IS_TRASHED}, args, null)) {
+            if (cursor == null || !cursor.moveToFirst()) return true;
+            return cursor.getInt(0) == 1;
+        } catch (Exception error) {
+            return false;
         }
     }
 
